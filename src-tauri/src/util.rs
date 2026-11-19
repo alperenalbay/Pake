@@ -117,10 +117,25 @@ fn apply_runtime_override(
             .to_string_lossy()
             .into_owned();
     }
+    pake_config.runtime_extensions = runtime_extensions(dir);
     pake_config.runtime_app = true;
     tauri_config.identifier = app.identifier;
     tauri_config.product_name = Some(app.product_name);
     Ok((pake_config, tauri_config))
+}
+
+/// `pake-runtime/extensions` when at least one folder in it has a manifest.
+/// Linux has no browser extensions in WebKitGTK, so it never reports one.
+fn runtime_extensions(dir: &Path) -> Option<PathBuf> {
+    if cfg!(target_os = "linux") {
+        return None;
+    }
+    let directory = dir.join("extensions");
+    std::fs::read_dir(&directory)
+        .ok()?
+        .filter_map(Result::ok)
+        .any(|entry| entry.path().join("manifest.json").is_file())
+        .then_some(directory)
 }
 
 /// Same rule as the CLI's --identifier check, capped at the 128 characters an
@@ -967,6 +982,20 @@ mod tests {
         let (pake, _) = apply_runtime_override(pake, tauri, Some(&dir)).unwrap();
         assert_eq!(PathBuf::from(&pake.system_tray_path), absolute);
         assert!(pake.runtime_custom_js.is_none());
+        // No extensions folder, or one without a manifest in it, changes nothing.
+        assert!(pake.runtime_extensions.is_none());
+        fs::create_dir_all(dir.join("extensions/empty")).unwrap();
+        assert!(runtime_extensions(&dir).is_none());
+
+        fs::create_dir_all(dir.join("extensions/dark-reader")).unwrap();
+        fs::write(dir.join("extensions/dark-reader/manifest.json"), "{}").unwrap();
+        let (pake, tauri) = compiled_configs();
+        let (pake, _) = apply_runtime_override(pake, tauri, Some(&dir)).unwrap();
+        if cfg!(target_os = "linux") {
+            assert!(pake.runtime_extensions.is_none());
+        } else {
+            assert_eq!(pake.runtime_extensions, Some(dir.join("extensions")));
+        }
         fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
@@ -1050,5 +1079,29 @@ mod tests {
         ] {
             assert!(!is_valid_identifier(id), "{id}");
         }
+    }
+
+    #[test]
+    fn macos_keeps_webkits_own_fullscreen_instead_of_the_polyfill() {
+        // Under the polyfill YouTube's button made the window full screen and
+        // left the video a small box. The script must read the engine's answer
+        // and leave before it marks itself installed or replaces anything. It
+        // is read here, not in window.rs, which a source test holds to naming
+        // the script once, where it is injected.
+        let script = include_str!("inject/fullscreen.js").replace("\r\n", "\n");
+        let asks = script
+            .find("function engineHasFullscreen() {")
+            .expect("the script asks the engine first");
+        let mac_only = script[asks..]
+            .find("if (!/^Mac/.test(navigator.platform || \"\")) return false;")
+            .expect("only a Mac's engine is trusted with it");
+        let leaves = script
+            .find("if (engineHasFullscreen()) return;")
+            .expect("the polyfill stays out where the engine has fullscreen");
+        let installs = script
+            .find("window.__PAKE_FULLSCREEN_POLYFILL__ = true;")
+            .expect("the polyfill marks itself installed");
+        assert!(mac_only < 200);
+        assert!(asks < leaves && leaves < installs);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "pake"
-version = "3.18.0"
+version = "3.19.5"
 description = "🤱🏻 Turn any webpage into a desktop app with Rust."
 authors = ["Tw93"]
 license = "GPL-3.0-or-later"
@@ -15,25 +15,33 @@ crate-type = ["staticlib", "cdylib", "lib"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [build-dependencies]
-tauri-build = { version = "2.5.5", features = [] }
+tauri-build = { version = "2.7.5", features = [] }
 
 [dependencies]
-serde_json = "1.0.149"
-serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.49.0", features = ["time", "fs"] }
-tauri = { version = "2.10.2", features = [
+serde_json = "1.0.154"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["time", "fs"] }
+# Content blocking (feature `content-blocking`): Brave's filter engine, MPL-2.0.
+# Without single-thread its Engine is Send + Sync for the WebView2 handler.
+adblock = { version = "0.13.6", default-features = false, features = [
+  "content-blocking",
+  "embedded-domain-resolver",
+  "full-regex-handling",
+], optional = true }
+flate2 = { version = "1.1.11", optional = true }
+tauri = { version = "2.12.6", features = [
   "tray-icon",
   "image-ico",
   "image-png",
 ] }
-tauri-plugin-window-state = "2.4.1"
-tauri-plugin-oauth = "2.0.0"
-tauri-plugin-http = "2.5.7"
-tauri-plugin-global-shortcut = { version = "2.3.1" }
-tauri-plugin-shell = { version = "2.3.5" }
-tauri-plugin-opener = { version = "2.5.3" }
-tauri-plugin-single-instance = "2.4.0"
-tauri-plugin-notification = "2.3.3"
+tauri-plugin-window-state = "2.5.0"
+tauri-plugin-oauth = "2.1.0"
+tauri-plugin-http = "2.9.0"
+tauri-plugin-global-shortcut = { version = "2.4.1" }
+tauri-plugin-shell = { version = "2.6.0" }
+tauri-plugin-opener = { version = "2.7.3" }
+tauri-plugin-single-instance = "2.5.5"
+tauri-plugin-notification = "2.8.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
@@ -42,14 +50,34 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSDockTile", "NSWindow"] }
 objc2-foundation = { version = "0.3", features = [
   "NSArray",
+  "NSEnumerator",
+  "NSError",
   "NSLocale",
+  "NSDate",
+  "NSSet",
   "NSString",
+  "NSURL",
+  "NSUUID",
   "NSUserNotification",
 ] }
 objc2-web-kit = { version = "0.3", default-features = false, features = [
   "std",
+  "block2",
+  "WKContentRuleList",
+  "WKContentRuleListStore",
   "WKUserContentController",
+  "WKWebExtension",
+  "WKWebExtensionContext",
+  "WKWebExtensionController",
+  "WKWebExtensionControllerConfiguration",
+  "WKWebExtensionControllerDelegate",
+  "WKWebExtensionMatchPattern",
+  "WKWebExtensionPermission",
+  "WKWebExtensionTab",
+  "WKWebExtensionTabConfiguration",
+  "WKWebExtensionWindow",
   "WKWebViewConfiguration",
+  "WKWebsiteDataStore",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -63,6 +91,8 @@ gtk = "0.18"
 # Reads the freedesktop color-scheme from the settings portal. Same version
 # and features that tauri-plugin-opener and single-instance already lock.
 zbus = "5.14"
+# WebKitGTK's content filter store, which the safe webkit2gtk crate leaves out.
+webkit2gtk-sys = { version = "=2.0.2", features = ["v2_40"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -73,9 +103,9 @@ windows-sys = { version = "0.61.2", features = [
   "Win32_UI_WindowsAndMessaging",
 ] }
 # Used for native WebView2 GoBack/GoForward on error pages (no page JS).
-webview2-com = "0.38"
+webview2-com = "0.39"
 # The generated WebView2 interfaces use this trait for COM interface casts.
-windows-core = "0.61.2"
+windows-core = "0.62.2"
 
 [features]
 # Opt-in native Windows test harness; not enabled by packaged apps.
@@ -84,7 +114,10 @@ native-download-probe = []
 cli-build = []
 # Prebuilt template that reads a pake-runtime folder at launch: Contents/Resources
 # on macOS, next to the executable elsewhere. The CLI never enables it.
-runtime-template = []
+runtime-template = ["content-blocking"]
+# Ad, tracker and cookie-notice blocking with the lists in ../filters, which the
+# npm package does not ship; the CLI never enables it.
+content-blocking = ["dep:adblock", "dep:flate2", "dep:webkit2gtk-sys"]
 # Tauri's macOS proxy APIs require macOS 14 or later. The CLI enables this
 # feature only after checking the host Darwin version.
 macos-proxy = ["tauri/macos-proxy"]
@@ -96,7 +129,16 @@ default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 
 [profile.release]
-panic = "abort"
+# Unwind, not abort: under abort Wry's objc2::exception::catch cannot hold, so
+# an Objective-C exception that crosses a Rust frame ends the whole app. WebKit
+# raises one when an answer arrives for a request a closing or leaving page had
+# out, and a sign-in popup closing itself ended the app that way. Costs about
+# 1.9 MB per architecture on macOS (12.8 to 14.7 MB on arm64, 2026-11-19).
+# Windows and Linux have no such exception and pay more for it (4.5 MB on
+# Windows x64), so the CLI builds them with CARGO_PROFILE_RELEASE_PANIC=abort
+# (bin/builders/env.ts); a plain `tauri build` there unwinds, which is only
+# larger.
+panic = "unwind"
 codegen-units = 1
 lto = "thin"
 opt-level = "z"

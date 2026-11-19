@@ -25,7 +25,7 @@ function page(stage, origin) {
   return `<!doctype html><meta charset="utf-8"><title>Pake IPC security probe</title>
 <body>Testing ${stage} origin permissions<main><section id="player"><video></video><button>Pause</button></section></main><script>
 (async () => {
-  const invoke = window.__TAURI__.core.invoke;
+  const invoke = window.__PAKE_NATIVE__.core.invoke;
   const check = async (command, args) => {
     try { await invoke(command, args); return "allowed"; }
     catch (error) { return "denied: " + String(error); }
@@ -64,12 +64,11 @@ function page(stage, origin) {
     anchor.remove();
     await new Promise(resolve => setTimeout(resolve, 500));
   }
-  const player = document.querySelector("#player");
-  const parent = player.parentElement;
-  try { await player.requestFullscreen(); results.fullscreen = "allowed"; }
-  catch (error) { results.fullscreen = "denied: " + String(error); }
-  results.layoutPreserved = player.parentElement === parent
-    && document.fullscreenElement === null && !document.querySelector(".pake-fullscreen-element, .pake-fullscreen-active");
+  // The polyfill's route to a full-screen window, where the engine has no
+  // fullscreen of its own. macOS uses WebKit's, which is no IPC call and asks
+  // for a user gesture as a browser does; tests/browser/fullscreen.mjs holds
+  // the polyfill to leaving the player alone when this is denied.
+  results.fullscreen = await check("plugin:window|set_fullscreen", {label: "pake", value: true});
   `
       : ""
   }
@@ -248,11 +247,6 @@ try {
   }
   assert.match(untrusted.fullscreen, /^denied: .*not allowed/i);
   assert.equal(
-    untrusted.layoutPreserved,
-    true,
-    "denied fullscreen changed the player layout",
-  );
-  assert.equal(
     await fs.readFile(path.join(downloads, "entry.txt"), "utf8"),
     "pake-native-ipc-proof",
   );
@@ -267,7 +261,7 @@ try {
     await assert.rejects(fs.stat(file), { code: "ENOENT" });
   }
   console.log(
-    "Native IPC PASS: download UA, Referer and HttpOnly cookies match the webview; entry commands and window.print work, cross-origin commands are denied, browser downloads survive denied IPC, fullscreen denial preserves layout, traversal remains inside Downloads.",
+    "Native IPC PASS: download UA, Referer and HttpOnly cookies match the webview; entry commands and window.print work, cross-origin commands are denied, browser downloads survive denied IPC, an untrusted origin cannot make the window full screen, traversal remains inside Downloads.",
   );
 } finally {
   if (app && app.exitCode === null) {

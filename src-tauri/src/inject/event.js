@@ -2,7 +2,7 @@
 // on blank error shells (no JS context). Falls back to history/location when
 // the IPC bridge is unavailable.
 function nativeNavigate(action) {
-  const invoke = window.__TAURI__?.core?.invoke;
+  const invoke = window.__PAKE_NATIVE__?.core?.invoke;
   if (invoke) {
     invoke("webview_navigate", { action }).catch(() => {
       fallbackNavigate(action);
@@ -41,7 +41,7 @@ function setZoom(zoom) {
   // on macOS. Native zoom recalculates layout exactly like a browser does.
   const zoomPercent = normalizeZoomPercent(zoom);
   const normalizedZoom = `${zoomPercent}%`;
-  const invoke = window.__TAURI__?.core?.invoke;
+  const invoke = window.__PAKE_NATIVE__?.core?.invoke;
   if (invoke) {
     invoke("set_zoom", { percent: zoomPercent }).catch(() => {});
   }
@@ -89,11 +89,11 @@ function handleShortcut(event) {
 // and Ctrl+L. A browser keeps all three for itself, so no page relies on them.
 function closeCurrentWindow() {
   // close() raises the window's close request, so hide-on-close still applies.
-  window.__TAURI__?.window?.getCurrentWindow?.()?.close?.();
+  window.__PAKE_NATIVE__?.window?.getCurrentWindow?.()?.close?.();
 }
 
 function quitApp() {
-  window.__TAURI__?.core?.invoke?.("quit_app")?.catch?.(() => {});
+  window.__PAKE_NATIVE__?.core?.invoke?.("quit_app")?.catch?.(() => {});
 }
 
 function copyPageAddress() {
@@ -194,7 +194,7 @@ function handleWindowFullscreenShortcut(event) {
     return;
   }
 
-  const appWindow = window.__TAURI__?.window?.getCurrentWindow?.();
+  const appWindow = window.__PAKE_NATIVE__?.window?.getCurrentWindow?.();
   if (!appWindow) {
     return;
   }
@@ -673,6 +673,34 @@ function openAuthNavigation(originalWindowOpen, url, name, specs) {
   return authWindow;
 }
 
+// A popup's page closes itself the moment it has answered its opener, often
+// in its first script, while an IPC call of that page load is still out:
+// Tauri's notification plugin asks for its permission in every document.
+// WebKit cancels a closing page's requests, and on macOS the answer to a
+// cancelled IPC request ends the whole app, because the release profile
+// cannot catch the exception WebKit raises for it (measured: every sign-in
+// popup that closed itself took the app with it). The answer takes a couple
+// of milliseconds, so the close waits them out. Every top-level page gets
+// the wait: a popup opened with noopener has no window.opener to tell it by.
+// In the main window it is a precaution only; a first page that closed
+// itself there did not end the app in three runs without it.
+const WINDOW_CLOSE_DELAY_MS = 150;
+function deferWindowClose() {
+  if (window !== window.top) return;
+  if (!/mac/i.test(getDesktopPlatform())) return;
+  const nativeClose = window.close.bind(window);
+  let pending = false;
+  window.close = function () {
+    if (pending) return;
+    pending = true;
+    setTimeout(() => {
+      pending = false;
+      nativeClose();
+    }, WINDOW_CLOSE_DELAY_MS);
+  };
+}
+deferWindowClose();
+
 // Install the receiver at document start: a subframe can open a link before
 // the main page's DOMContentLoaded routing setup has run.
 let openFrameLink = null;
@@ -714,7 +742,7 @@ window.addEventListener("pagehide", () => {
 });
 
 document.addEventListener("DOMContentLoaded", () => {
-  const tauri = window.__TAURI__;
+  const tauri = window.__PAKE_NATIVE__;
   const appWindow = tauri.window.getCurrentWindow();
   const invoke = tauri.core.invoke;
   const pakeConfig = window["pakeConfig"] || {};
@@ -792,6 +820,13 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
+    // WebView2 runs this script in subframes too, where IPC is denied for the
+    // frame's own origin. Hand the link to the top page like frame_links.js.
+    if (window.top !== window) {
+      window.top.postMessage({ type: "pake:frame-external-link", url }, "*");
+      return;
+    }
+
     invoke("plugin:shell|open", {
       path: url,
     }).catch((error) => {
@@ -833,6 +868,103 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const isInternalUrl = (url) => matchesInternalUrl(url, window.location.href);
 
+  // An internal target="_blank" link clicked with --new-window, waiting for
+  // the page's own handlers to have their say.
+  let pendingBlankLink = null;
+  const openUnhandledBlankLink = (e) => {
+    const pending = pendingBlankLink;
+    pendingBlankLink = null;
+    if (!pending || pending.event !== e || e.defaultPrevented) return;
+    if (pending.url) {
+      e.preventDefault();
+      originalWindowOpen.call(window, pending.url, "_blank");
+      return;
+    }
+    routeLateNewTabLink(e, pending.anchor);
+  };
+
+  // A held link got its address during the click and nobody handled it: route
+  // it now as the click guard would have at the start. An internal address
+  // without --new-window is left to the default action, which follows the
+  // link's _self target inside the app.
+  const routeLateNewTabLink = (e, anchorElement) => {
+    let lateUrl;
+    try {
+      lateUrl = new URL(anchorElement.href);
+    } catch (error) {
+      return;
+    }
+    if (!["http:", "https:"].includes(lateUrl.protocol)) return;
+    const absoluteUrl = lateUrl.href;
+    if (forceInternalNavigation || window.isAuthLink(absoluteUrl)) {
+      e.preventDefault();
+      window.location.href = absoluteUrl;
+      return;
+    }
+    if (isInternalUrl(absoluteUrl)) {
+      if (window.pakeConfig?.new_window) {
+        e.preventDefault();
+        originalWindowOpen.call(window, absoluteUrl, "_blank");
+      }
+      return;
+    }
+    e.preventDefault();
+    handleExternalLink(absoluteUrl);
+  };
+
+  // A new-tab link with no address yet. Some pages give the link its address
+  // during the click and handle the click themselves: Douyin's episode covers
+  // are <a target="_blank"> with no href, their own handler sets the href to
+  // "undefined", switches the video and prevents the default. The click guard
+  // skipped a link with no address, so it kept its _blank target through the
+  // bubble, where Tauri's shell plugin opens whatever address the link has by
+  // then, handled or not: the browser came up at douyin.com/undefined on every
+  // switch, with or without --new-window (the same user's second report,
+  // 2026-11-19; the first fix only held links that had an address when the
+  // click began). The target is taken away for the click, and
+  // openUnhandledBlankLink routes the link if nobody handled it.
+  const holdAddresslessNewTabLink = (e, anchorElement) => {
+    const askedFor = anchorElement.target;
+    anchorElement.target = "_self";
+    pendingBlankLink = { event: e, anchor: anchorElement, url: null };
+    setTimeout(() => {
+      anchorElement.target = askedFor;
+    }, 0);
+  };
+
+  // An internal link that asks for a new tab (target _blank or _new).
+  //
+  // With --new-window the Rust on_new_window handler opens an in-app window.
+  // Without it, leaving the target untouched lets the native webview
+  // escalate the click to a system-browser "new window".
+  //
+  // Many SPAs (e.g. Plane) tag in-app links with target="_blank" but route
+  // the click themselves via a React onClick that calls preventDefault +
+  // client-side navigation. Forcing a full window.location reload here (and
+  // stopping propagation) would defeat that handler and reload the whole app
+  // on every click. Instead, retarget the link to "_self" so the webview
+  // never opens a browser window, then let the page's own handler run. If
+  // nothing intercepts the click, the default _self navigation keeps it
+  // inside the app.
+  //
+  // With --new-window the link is retargeted for this click as well: left
+  // as _blank, Tauri's shell plugin, whose own click listener on body opens
+  // every target="_blank" link in the system browser without asking whether
+  // the page handled the click, sent the link there even after the page had
+  // (Douyin's episode list: each switch opened douyin.com/undefined in the
+  // browser, a user's report, 2026-11-18). openUnhandledBlankLink, last in
+  // the bubble, opens the in-app window when nobody prevented the click.
+  const keepInternalNewTabLinkInApp = (e, anchorElement, absoluteUrl) => {
+    const askedFor = anchorElement.target;
+    anchorElement.target = "_self";
+    if (window.pakeConfig?.new_window) {
+      pendingBlankLink = { event: e, anchor: anchorElement, url: absoluteUrl };
+      setTimeout(() => {
+        anchorElement.target = askedFor;
+      }, 0);
+    }
+  };
+
   const detectAnchorElementClick = (e) => {
     // Safety check: ensure e.target exists and is an Element with closest method
     if (!e.target || typeof e.target.closest !== "function") {
@@ -841,6 +973,15 @@ document.addEventListener("DOMContentLoaded", () => {
     const anchorElement = e.target.closest("a");
 
     if (anchorElement && nativeDownloadAnchors.has(anchorElement)) return;
+
+    if (
+      anchorElement &&
+      !anchorElement.href &&
+      anchorElement.target === "_blank"
+    ) {
+      holdAddresslessNewTabLink(e, anchorElement);
+      return;
+    }
 
     if (anchorElement && anchorElement.href) {
       const rawHref = anchorElement.getAttribute("href") || "";
@@ -886,21 +1027,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
 
         if (isInternalUrl(absoluteUrl)) {
-          // With --new-window the Rust on_new_window handler opens an in-app
-          // window. Without it, leaving target="_blank" untouched lets the
-          // native webview escalate the click to a system-browser "new window".
-          //
-          // Many SPAs (e.g. Plane) tag in-app links with target="_blank" but
-          // route the click themselves via a React onClick that calls
-          // preventDefault + client-side navigation. Forcing a full
-          // window.location reload here (and stopping propagation) would defeat
-          // that handler and reload the whole app on every click. Instead,
-          // retarget the link to "_self" so the webview never opens a browser
-          // window, then let the page's own handler run. If nothing intercepts
-          // the click, the default _self navigation keeps it inside the app.
-          if (!window.pakeConfig?.new_window) {
-            anchorElement.target = "_self";
-          }
+          keepInternalNewTabLinkInApp(e, anchorElement, absoluteUrl);
           return;
         }
 
@@ -915,6 +1042,14 @@ document.addEventListener("DOMContentLoaded", () => {
           e.preventDefault();
           e.stopImmediatePropagation();
           window.location.href = absoluteUrl;
+          return;
+        }
+
+        // "_new" is one more name for a new tab: a link to the app's own
+        // site stays in the app as a _blank one does, instead of leaving
+        // for the system browser.
+        if (isInternalUrl(absoluteUrl)) {
+          keepInternalNewTabLinkInApp(e, anchorElement, absoluteUrl);
           return;
         }
 
@@ -963,6 +1098,7 @@ document.addEventListener("DOMContentLoaded", () => {
   window.addEventListener("click", (event) =>
     handleProtocolLinkClick(event, handleExternalLink),
   );
+  window.addEventListener("click", openUnhandledBlankLink);
 
   // Capture web links before site popup handlers route them into the app.
   document.addEventListener("click", detectAnchorElementClick, true);
@@ -986,7 +1122,42 @@ document.addEventListener("DOMContentLoaded", () => {
       return originalWindowOpen.call(window, url, name, specs);
     }
 
-    // Avoid macOS WebKit auth-popup crashes by navigating auth URLs in-place.
+    // A sized sign-in popup, or a sized popup of the app's own site, answers
+    // its opener and closes; it gets a real window on macOS and Windows.
+    if (opensSignInPopups() && requestsPopupWindow(name, specs)) {
+      let popupUrl = "";
+      try {
+        popupUrl = new URL(url, window.location.href).href;
+      } catch (error) {
+        popupUrl = "";
+      }
+      // WebView2 runs this script in subframes too, where the app's own site
+      // is the configured one, not the frame's address.
+      const ownSite =
+        window === window.top
+          ? isInternalUrl(popupUrl)
+          : matchesInternalUrl(
+              popupUrl,
+              window.pakeConfig?.url || window.location.href,
+            );
+      if (
+        /^https?:/i.test(popupUrl) &&
+        (window.isAuthPopup(popupUrl, name) ||
+          (!window.pakeConfig?.new_window && ownSite))
+      ) {
+        // Straight to its address, as a browser opens it: the native handler
+        // builds a sized popup under every setting. Opening it blank first
+        // and then sending it there lost the opener on sites that set
+        // Cross-Origin-Opener-Policy (X does): WebKit keeps a popup with its
+        // opener across that policy only on the popup's first navigation.
+        const popup = originalWindowOpen.call(window, popupUrl, name, specs);
+        if (popup) return popup;
+      }
+    }
+
+    // Every other sign-in window.open: no size, noopener, a _self target, a
+    // popup the engine refused, and all of them on Linux. macOS and Linux
+    // continue in the current window, Windows asks for a native popup first.
     if (window.isAuthPopup(url, name)) {
       try {
         const baseUrl = window.location.origin + window.location.pathname;
@@ -1395,7 +1566,7 @@ document.addEventListener("DOMContentLoaded", () => {
 // for DOMContentLoaded so feature-detection on Notification/setAppBadge
 // returns the polyfill before site scripts run.
 (function () {
-  const invoke = window.__TAURI__?.core?.invoke;
+  const invoke = window.__PAKE_NATIVE__?.core?.invoke;
   if (!invoke) return;
   if (typeof EventTarget !== "function" || typeof Event !== "function") return;
 

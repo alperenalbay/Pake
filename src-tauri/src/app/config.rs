@@ -41,6 +41,10 @@ pub struct WindowConfig {
     pub internal_url_regex: String,
     #[serde(default)]
     pub enable_find: bool,
+    /// macOS only: Back and Forward buttons in the title bar, beside the
+    /// traffic lights. Off unless the app asks for them.
+    #[serde(default)]
+    pub navigation_buttons: bool,
     #[serde(default = "default_zoom")]
     pub zoom: u32,
     #[serde(default)]
@@ -133,9 +137,17 @@ pub struct PakeConfig {
     /// login item in step at every start (see `autostart.rs`).
     #[serde(default)]
     pub launch_at_login: bool,
+    /// Built-in filter lists to block with: `ads`, `trackers`, `cookies`,
+    /// `china`. Only builds with the `content-blocking` feature read it.
+    #[serde(default)]
+    pub content_blocking: Vec<String>,
     /// Replaces the compiled custom.js when a runtime override supplies one.
     #[serde(skip)]
     pub runtime_custom_js: Option<String>,
+    /// The `extensions` folder of a runtime override when it holds an unpacked
+    /// browser extension. macOS 15.4 and later and Windows load what is in it.
+    #[serde(skip)]
+    pub runtime_extensions: Option<std::path::PathBuf>,
     /// Set when a runtime override supplied the app identity, so per-app
     /// directories follow the identifier rather than the product name.
     #[serde(skip)]
@@ -258,6 +270,19 @@ mod tests {
         let legacy: WindowConfig = serde_json::from_value(legacy).unwrap();
         assert!(!legacy.password_autosave);
         assert!(!legacy.password_autosave_enabled());
+    }
+
+    #[test]
+    fn navigation_buttons_are_opt_in() {
+        let window = config_for("https://example.com").windows.remove(0);
+        let mut window = serde_json::to_value(window).unwrap();
+        window.as_object_mut().unwrap().remove("navigation_buttons");
+        let legacy: WindowConfig = serde_json::from_value(window.clone()).unwrap();
+        assert!(!legacy.navigation_buttons);
+
+        window["navigation_buttons"] = true.into();
+        let asked: WindowConfig = serde_json::from_value(window).unwrap();
+        assert!(asked.navigation_buttons);
     }
 
     #[test]

@@ -9,6 +9,9 @@ function loadEventHelpers({
   initialZoom = null,
   downloadError = null,
   nativeDownloads = false,
+  topWindow = null,
+  opener = null,
+  nativeClose = () => {},
 } = {}) {
   const source = ["link_policy.js", "event.js"]
     .map((file) =>
@@ -106,6 +109,8 @@ function loadEventHelpers({
       addEventListener: registerListener,
       dispatchEvent: () => {},
       open: () => ({}),
+      opener,
+      close: nativeClose,
       isAuthLink: () => false,
       isAuthPopup: () => false,
       pakeConfig: {},
@@ -121,8 +126,9 @@ function loadEventHelpers({
     },
   };
   context.window.navigator = context.navigator;
+  context.window.top = topWindow || context.window;
   if (withTauri) {
-    context.window.__TAURI__ = {
+    context.window.__PAKE_NATIVE__ = {
       core: { invoke },
       window: {
         getCurrentWindow: () => ({
@@ -281,6 +287,225 @@ describe("event link guard", () => {
       ).toEqual([]);
     },
   );
+
+  const GOOGLE_POPUP =
+    "https://accounts.google.com/o/oauth2/v2/auth?gsiwebsdk=gis_attributes&client_id=1";
+  const GOOGLE_SPECS =
+    "toolbar=no,location=no,menubar=no,resizable=no,width=590,height=830,top=143.5,left=569";
+  const loadPopupPage = (userAgent, config = {}) => {
+    const context = loadEventHelpers({ withTauri: true, userAgent });
+    context.window.pakeConfig = config;
+    context.window.isAuthPopup = (url) => url.includes("accounts.google.com");
+    const popup = { location: { href: "about:blank" }, close: vi.fn() };
+    const nativeOpen = vi.fn(() => popup);
+    context.window.open = nativeOpen;
+    runDomReady(context);
+    return { context, popup, nativeOpen };
+  };
+  const MAC = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_5)";
+
+  const WINDOWS = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
+  const LINUX = "Mozilla/5.0 (X11; Linux x86_64)";
+
+  it.each([
+    ["macOS", MAC],
+    ["Windows", WINDOWS],
+  ])(
+    "gives a sized sign-in popup its own window and opener on %s",
+    (_platform, userAgent) => {
+      // TikTok's Google button: the page waits for this popup to answer it.
+      const { context, popup, nativeOpen } = loadPopupPage(userAgent);
+      const result = context.window.open(
+        GOOGLE_POPUP,
+        "g_auth_token_window",
+        GOOGLE_SPECS,
+      );
+      expect(result).toBe(popup);
+      // Straight to its address: a popup opened blank and sent there
+      // afterwards loses its opener on a site with an opener policy.
+      expect(nativeOpen.mock.calls).toEqual([
+        [GOOGLE_POPUP, "g_auth_token_window", GOOGLE_SPECS],
+      ]);
+      expect(context.window.location.href).toBe("https://example.com/app");
+    },
+  );
+
+  it("keeps Linux on its previous sign-in route until popups are checked there", () => {
+    const { context, nativeOpen } = loadPopupPage(LINUX);
+    expect(
+      context.window.open(GOOGLE_POPUP, "g_auth_token_window", GOOGLE_SPECS),
+    ).toBe(context.window);
+    expect(nativeOpen).not.toHaveBeenCalled();
+    expect(context.window.location.href).toBe(GOOGLE_POPUP);
+  });
+
+  it("judges the app's own site by its configured address in a Windows subframe", () => {
+    // WebView2 runs event.js in frames; a widget's own address is not the app.
+    const load = () => {
+      const context = loadEventHelpers({
+        withTauri: true,
+        userAgent: WINDOWS,
+        topWindow: { postMessage: () => {} },
+      });
+      context.window.pakeConfig = { url: "https://app.example.net/" };
+      const popup = { location: { href: "about:blank" }, close: vi.fn() };
+      const nativeOpen = vi.fn(() => popup);
+      context.window.open = nativeOpen;
+      runDomReady(context);
+      return { context, popup, nativeOpen };
+    };
+
+    const widget = load();
+    widget.context.window.open(
+      "https://example.com/share",
+      "share",
+      "width=600,height=400",
+    );
+    expect(widget.nativeOpen).not.toHaveBeenCalled();
+
+    const app = load();
+    expect(
+      app.context.window.open(
+        "https://app.example.net/popup",
+        "flow",
+        "width=600,height=400",
+      ),
+    ).toBe(app.popup);
+    expect(app.nativeOpen.mock.calls).toEqual([
+      ["https://app.example.net/popup", "flow", "width=600,height=400"],
+    ]);
+  });
+
+  it("gives a sized popup of the app's own site its own window", () => {
+    // Notion's Google button opens a page of its own that redirects to Google.
+    const { context, popup, nativeOpen } = loadPopupPage(MAC);
+    const specs = "toolbar=0,menubar=0,location=0,width=610,height=700";
+    const result = context.window.open(
+      "/verifyNoPopupBlockerHtmlAndRedirect?redirectUri=x",
+      " Google",
+      specs,
+    );
+    expect(result).toBe(popup);
+    expect(nativeOpen.mock.calls).toEqual([
+      [
+        "https://example.com/verifyNoPopupBlockerHtmlAndRedirect?redirectUri=x",
+        " Google",
+        specs,
+      ],
+    ]);
+    expect(context.window.location.href).toBe("https://example.com/app");
+  });
+
+  it("leaves a sized own-site popup on the native route with new_window", () => {
+    const { context, popup, nativeOpen } = loadPopupPage(MAC, {
+      new_window: true,
+    });
+    expect(context.window.open("/compose", "compose", "width=600")).toBe(popup);
+    expect(nativeOpen.mock.calls).toEqual([
+      ["https://example.com/compose", "compose", "width=600"],
+    ]);
+  });
+
+  it.each([
+    ["no features", "oauth", undefined],
+    ["noopener", "oauth", "noopener,width=590,height=830"],
+    ["noopener after a space", "oauth", "width=590 height=830 noopener"],
+    ["a _self target", "_self", "width=590,height=830"],
+    ["a zero size", "oauth", "width=0,height=0"],
+    ["popup=no beside a size", "oauth", "popup=no,width=590,height=830"],
+  ])(
+    "keeps a macOS sign-in with %s in the current window",
+    (_case, name, specs) => {
+      const { context, nativeOpen } = loadPopupPage(MAC);
+      expect(context.window.open(GOOGLE_POPUP, name, specs)).toBe(
+        context.window,
+      );
+      expect(nativeOpen).not.toHaveBeenCalled();
+      expect(context.window.location.href).toBe(GOOGLE_POPUP);
+    },
+  );
+
+  it("falls back to the current window when the popup is refused", () => {
+    const { context, nativeOpen } = loadPopupPage(MAC);
+    nativeOpen.mockReturnValue(null);
+    expect(context.window.open(GOOGLE_POPUP, "oauth", GOOGLE_SPECS)).toBe(
+      context.window,
+    );
+    expect(nativeOpen.mock.calls).toEqual([
+      [GOOGLE_POPUP, "oauth", GOOGLE_SPECS],
+    ]);
+    expect(context.window.location.href).toBe(GOOGLE_POPUP);
+  });
+
+  it.each([
+    ["a popup", {}],
+    ["the main window", null],
+  ])(
+    "waits out the page load's IPC before %s closes itself on macOS",
+    (_case, opener) => {
+      vi.useFakeTimers();
+      try {
+        const nativeClose = vi.fn();
+        const { window } = loadEventHelpers({
+          userAgent: MAC,
+          opener,
+          nativeClose,
+        });
+        // A callback page answers its opener and closes in its first script.
+        window.close();
+        window.close();
+        expect(nativeClose).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(149);
+        expect(nativeClose).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(1);
+        expect(nativeClose).toHaveBeenCalledOnce();
+        // A close the engine refused does not swallow the next one.
+        window.close();
+        vi.advanceTimersByTime(150);
+        expect(nativeClose).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each([
+    ["Windows", WINDOWS],
+    ["Linux", LINUX],
+  ])("leaves window.close alone on %s", (_platform, userAgent) => {
+    const nativeClose = vi.fn();
+    const { window } = loadEventHelpers({ userAgent, opener: {}, nativeClose });
+    window.close();
+    expect(nativeClose).toHaveBeenCalledOnce();
+  });
+
+  it("leaves a frame's window.close alone on macOS", () => {
+    const nativeClose = vi.fn();
+    const { window } = loadEventHelpers({
+      userAgent: MAC,
+      nativeClose,
+      topWindow: { postMessage: () => {} },
+    });
+    window.close();
+    expect(nativeClose).toHaveBeenCalledOnce();
+  });
+
+  it("still sends a sized popup of another site to the system browser", () => {
+    const { context, nativeOpen } = loadPopupPage(MAC);
+    expect(
+      context.window.open(
+        "https://outside.example/share",
+        "share",
+        "width=600,height=400",
+      ),
+    ).toBeNull();
+    expect(nativeOpen).not.toHaveBeenCalled();
+    expect(context.invokeCalls).toContainEqual([
+      "plugin:shell|open",
+      { path: "https://outside.example/share" },
+    ]);
+    expect(context.window.location.href).toBe("https://example.com/app");
+  });
 
   it.each(["https://outside.example/report", "https://example.com/report"])(
     "retains the default route for a new named context: %s",
@@ -845,6 +1070,170 @@ describe("event link guard", () => {
     expect(context.window.location.href).toBe("https://example.com/app");
   });
 
+  const loadNewWindowPage = () => {
+    vi.useFakeTimers();
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.pakeConfig = { new_window: true };
+    const nativeOpen = vi.fn(() => ({}));
+    context.window.open = nativeOpen;
+    runDomReady(context);
+    const lastInBubble = context.eventListeners.click.find(
+      ({ handler }) => handler.name === "openUnhandledBlankLink",
+    ).handler;
+    return { context, nativeOpen, lastInBubble };
+  };
+
+  it("leaves a new-window link the page handled itself alone", () => {
+    // Douyin's episode list: target="_blank", href "undefined", and a click
+    // handler that switches the video. Left as _blank it reached the shell
+    // plugin's own listener, which opened it in the system browser.
+    try {
+      const { context, nativeOpen, lastInBubble } = loadNewWindowPage();
+      const anchor = makeAnchor("https://example.com/undefined", "_blank");
+      const event = { ...makeClickEvent(anchor), defaultPrevented: false };
+      getClickGuard(context)(event);
+      expect(anchor.target).toBe("_self");
+      event.defaultPrevented = true; // the page's handler ran
+      lastInBubble(event);
+      expect(nativeOpen).not.toHaveBeenCalled();
+      expect(event.preventDefault).not.toHaveBeenCalled();
+      expect(
+        context.invokeCalls.filter(([cmd]) => cmd === "plugin:shell|open"),
+      ).toEqual([]);
+      vi.runAllTimers();
+      expect(anchor.target).toBe("_blank");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps an internal _new link in the app instead of the system browser", () => {
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.pakeConfig = { new_window: false };
+    runDomReady(context);
+    const anchor = makeAnchor("https://example.com/video/1", "_new");
+    const event = makeClickEvent(anchor);
+    getClickGuard(context)(event);
+    expect(anchor.target).toBe("_self");
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(
+      context.invokeCalls.filter(([cmd]) => cmd === "plugin:shell|open"),
+    ).toEqual([]);
+  });
+
+  const loadPageWithBubble = (newWindow) => {
+    vi.useFakeTimers();
+    const context = loadEventHelpers({ withTauri: true });
+    context.window.pakeConfig = { new_window: newWindow };
+    const nativeOpen = vi.fn(() => ({}));
+    context.window.open = nativeOpen;
+    runDomReady(context);
+    const lastInBubble = context.eventListeners.click.find(
+      ({ handler }) => handler.name === "openUnhandledBlankLink",
+    ).handler;
+    return { context, nativeOpen, lastInBubble };
+  };
+  const shellOpens = (context) =>
+    context.invokeCalls.filter(([cmd]) => cmd === "plugin:shell|open");
+
+  for (const newWindow of [false, true]) {
+    it(`takes the new-tab target off a link with no address for the click (new_window ${newWindow})`, () => {
+      // Douyin's episode covers: <a target="_blank"> with no href. Their own
+      // handler sets href to "undefined" during the click, switches the video
+      // and prevents the default. Left as _blank the link reached the shell
+      // plugin's listener, which opened douyin.com/undefined in the browser.
+      try {
+        const { context, nativeOpen, lastInBubble } =
+          loadPageWithBubble(newWindow);
+        const anchor = makeAnchor("", "_blank");
+        const event = { ...makeClickEvent(anchor), defaultPrevented: false };
+        getClickGuard(context)(event);
+        // What the shell plugin's listener would read in the bubble.
+        expect(anchor.target).toBe("_self");
+        expect(event.preventDefault).not.toHaveBeenCalled();
+        // The page's handler: an address appears and the click is handled.
+        anchor.href = "https://example.com/undefined";
+        event.defaultPrevented = true;
+        lastInBubble(event);
+        expect(event.preventDefault).not.toHaveBeenCalled();
+        expect(nativeOpen).not.toHaveBeenCalled();
+        expect(shellOpens(context)).toEqual([]);
+        vi.runAllTimers();
+        expect(anchor.target).toBe("_blank");
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
+
+  it("routes a link that got an external address during the click, once", () => {
+    try {
+      const { context, nativeOpen, lastInBubble } = loadPageWithBubble(false);
+      const anchor = makeAnchor("", "_blank");
+      const event = { ...makeClickEvent(anchor), defaultPrevented: false };
+      getClickGuard(context)(event);
+      anchor.href = "https://other.example.org/page";
+      lastInBubble(event);
+      expect(event.preventDefault).toHaveBeenCalledOnce();
+      expect(shellOpens(context)).toHaveLength(1);
+      expect(nativeOpen).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a link that got an internal address during the click in the app", () => {
+    try {
+      // Without --new-window the default action follows the _self target.
+      const off = loadPageWithBubble(false);
+      const stay = makeAnchor("", "_blank");
+      const first = { ...makeClickEvent(stay), defaultPrevented: false };
+      getClickGuard(off.context)(first);
+      stay.href = "https://example.com/video/2";
+      off.lastInBubble(first);
+      expect(first.preventDefault).not.toHaveBeenCalled();
+      expect(shellOpens(off.context)).toEqual([]);
+      expect(off.nativeOpen).not.toHaveBeenCalled();
+      vi.useRealTimers();
+
+      // With it the link opens in an app window.
+      const on = loadPageWithBubble(true);
+      const open = makeAnchor("", "_blank");
+      const second = { ...makeClickEvent(open), defaultPrevented: false };
+      getClickGuard(on.context)(second);
+      open.href = "https://example.com/video/2";
+      on.lastInBubble(second);
+      expect(second.preventDefault).toHaveBeenCalledOnce();
+      expect(on.nativeOpen.mock.calls).toEqual([
+        ["https://example.com/video/2", "_blank"],
+      ]);
+      expect(shellOpens(on.context)).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("opens a new-window link nobody handled in an in-app window", () => {
+    try {
+      const { context, nativeOpen, lastInBubble } = loadNewWindowPage();
+      const anchor = makeAnchor("https://example.com/video/1", "_blank");
+      const event = { ...makeClickEvent(anchor), defaultPrevented: false };
+      getClickGuard(context)(event);
+      lastInBubble(event);
+      expect(event.preventDefault).toHaveBeenCalledOnce();
+      expect(nativeOpen.mock.calls).toEqual([
+        ["https://example.com/video/1", "_blank"],
+      ]);
+      // A later, unrelated click finds nothing pending.
+      lastInBubble({ defaultPrevented: false, preventDefault: vi.fn() });
+      expect(nativeOpen).toHaveBeenCalledOnce();
+      vi.runAllTimers();
+      expect(anchor.target).toBe("_blank");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("still opens external target=_blank links in the system browser", () => {
     const context = loadEventHelpers({ withTauri: true });
     context.window.pakeConfig = { new_window: false };
@@ -860,6 +1249,36 @@ describe("event link guard", () => {
       "plugin:shell|open",
       { path: "https://other.example.org/page" },
     ]);
+  });
+
+  it("hands external links from a subframe to the top page instead of IPC", () => {
+    // WebView2 injects event.js into subframes, whose origin has no IPC grant.
+    const messages = [];
+    const context = loadEventHelpers({
+      withTauri: true,
+      topWindow: { postMessage: (message) => messages.push(message) },
+    });
+    runDomReady(context);
+
+    expect(context.window.open("https://outside.example/launch")).toBeNull();
+    const event = makeClickEvent(
+      makeAnchor("https://outside.example/page", "_new"),
+    );
+    getClickGuard(context)(event);
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(messages).toEqual([
+      {
+        type: "pake:frame-external-link",
+        url: "https://outside.example/launch",
+      },
+      { type: "pake:frame-external-link", url: "https://outside.example/page" },
+    ]);
+    expect(
+      context.invokeCalls.filter(
+        ([command]) => command === "plugin:shell|open",
+      ),
+    ).toEqual([]);
   });
 
   it("bridges Web Badging API calls to explicit badge commands", async () => {

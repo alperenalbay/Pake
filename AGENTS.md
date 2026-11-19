@@ -61,7 +61,7 @@ For proactive latent-bug sweeps, pick one row and go deep; do not invent a whole
 | Download success semantics | `invoke.rs`, `window.rs` `on_download` | Non-2xx toasted as success; toast/IPC hardcoded to `"pake"`; request drops session cookies |
 | Menu / focused window      | `menu.rs`                              | Commands hit the main window, not the focused one; eval dead on error pages                |
 | Startup visibility         | `lib.rs`, `setup.rs`                   | Blank shell, `about:blank` false ready, user hide racing fallback reveal                   |
-| Auth / popup               | `auth.js`, `event.js`                  | macOS auth crash, SSO in system browser, Apple popup exception                             |
+| Auth / popup               | `auth.js`, `event.js`                  | Sign-in popup loses its opener or stays open, abort on its close, SSO in system browser    |
 | Clipboard                  | `event.js`                             | keydown steals native paste; double-paste fallback                                         |
 | Multi-window / icon        | `window.rs`, `setup.rs`                | Missing `reapply_window_icon` on show; secondary window toast/target; Cmd+N blank flash    |
 | Platform capability        | `auth.rs`, proxy, WebKit flags         | Flag name present, platform no-op                                                          |
@@ -118,6 +118,7 @@ Sort every community PR into one of three outcomes; never rewrite a contribution
 - **Merge as-is**: implementation is sound. Verify locally (build + relevant tests), merge, thank the author.
 - **Right direction, implementation needs work**: push fixes directly onto the contributor's branch so their authorship is preserved, then merge and reply summarizing what was changed and why.
 - **Out of scope**: close as not planned with a one-line apology and the boundary reason (what Pake deliberately does not do). Keep it friendly and leave room for discussion.
+- **Fork automation noise**: a PR from a fork's `main` whose only change is a file our own workflows regenerate (`CONTRIBUTORS.svg`, the `chore: update contributors and formatting [skip ci]` commits) is that workflow running in the fork. Close it directly with a short note, no need to ask the maintainer first (maintainer 2026-11-17).
 
 ## Troubleshooting
 

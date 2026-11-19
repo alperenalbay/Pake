@@ -387,13 +387,14 @@ Custom icon doesn't appear or shows default icon.
 
 Ensure you're using the correct icon format for your platform:
 
-- **macOS**: `.icns` format
+- **macOS**: `.icns`, or a local Icon Composer `.icon` package. If you pass a `.icon`, include a sibling `.icns` of the same basename for macOS versions before 26. Compiling the appearance variants needs Xcode 26+ (`actool`). If `actool` is missing, too old, or fails (see tauri-apps/tauri#15315 and #16386 on Xcode 27), the `.icns` fallback is used.
 - **Windows**: `.ico` format
 - **Linux**: `.png` format
 
 ```bash
 # macOS
 pake https://example.com --icon ./icon.icns
+pake https://example.com --icon ./AppIcon.icon
 
 # Windows
 pake https://example.com --icon ./icon.ico
@@ -402,7 +403,7 @@ pake https://example.com --icon ./icon.ico
 pake https://example.com --icon ./icon.png
 ```
 
-Pake can automatically convert icons, but providing the correct format is more reliable.
+Pake can automatically convert ordinary image files, but providing the correct format is more reliable. An Icon Composer `.icon` cannot be converted from a PNG and cannot be downloaded from a URL.
 
 ### Website Features Not Working (Login, Upload, etc.)
 
@@ -455,7 +456,7 @@ This is usually due to web compatibility issues. Try:
 
    Some authentication providers, especially Google, may block sign-in inside embedded webviews. Because Pake packages sites into a desktop webview, Google properties or sites that rely on Google OAuth may still fail to sign in even when `--new-window` or `--multi-window` is enabled. This is provider policy, not a packaging bug, so use the normal browser, a browser-installed app, or a native desktop client for those sites.
 
-   Pake keeps **Sign in with Apple** popup flows (e.g. Yelp, Upwork) on the native popup path so Apple's callback can return to the opener page. On macOS and Linux, other sign-in popups open in the current window instead, because the WebKit webview there can crash on them or drop them silently; on Windows they stay popups.
+   When a site signs in through a popup with a size of its own (the Google button on TikTok, Notion and X, or Sign in with Apple on Yelp and Upwork), Pake on macOS and Windows opens that popup as a separate window, so it can hand the result back to the page that opened it and close itself, with or without `--new-window`. A sign-in the site opens as a link, or as a `window.open` with no size, continues in the current window on macOS and Linux, and so does every sign-in popup on Linux for now.
 
    Passkeys and Touch ID sign-in are not available in Pake apps on macOS, because the system only offers them to browsers and to apps tied to the site's domain. Sign in with a password and a two-factor code instead.
 

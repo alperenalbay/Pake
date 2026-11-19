@@ -3,7 +3,10 @@
 //! WebKitGTK shows a bare engine message for a failed load and a dead grey view
 //! after its web process exits; WebView2 has its own error page but leaves a
 //! blank view after a renderer crash. Neither had a way back short of knowing
-//! Ctrl+R. macOS is not covered: Tauri 2.10 exposes neither hook for WKWebView.
+//! Ctrl+R. WKWebView is left blank as well when its web content process dies,
+//! and Tauri reloads it without a limit unless the app sets its own handler,
+//! so the macOS arm is that handler, with the limit the other two have. A
+//! failed load on macOS is still not covered.
 
 /// A page that takes its renderer down on every load must not be reloaded for ever: after
 /// `MAX_RELOADS` in `RELOAD_WINDOW` the view is left as it is.
@@ -20,7 +23,7 @@ pub(crate) fn may_reload(recent: &mut Vec<std::time::Instant>, now: std::time::I
     true
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn reload_allowed() -> bool {
     use std::cell::RefCell;
     thread_local! {
@@ -103,6 +106,22 @@ pub fn install(webview: &tauri::webview::PlatformWebview) {
     };
     if let Err(error) = result {
         eprintln!("[Pake] Failed to watch for a WebView2 renderer crash: {error}");
+    }
+}
+
+/// Bring a page back when its web content process dies: the window went
+/// white and stayed white, and a user who then quit got a crash report on top
+/// (a user's report, 2026-11-18). This is Tauri's own hook for it. Without a
+/// handler Tauri 2.12 reloads every time, so a page that takes its process
+/// down on each load would reload for ever.
+#[cfg(target_os = "macos")]
+pub fn on_web_process_terminated<R: tauri::Runtime>(webview: &tauri::Webview<R>) {
+    if !reload_allowed() {
+        return;
+    }
+    // Reload returns the page the dead process was showing.
+    if let Err(error) = webview.reload() {
+        eprintln!("[Pake] Failed to reload after the web process died: {error}");
     }
 }
 

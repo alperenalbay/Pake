@@ -1,21 +1,37 @@
-// Polyfill for HTML5 Fullscreen API in Tauri webview.
+// Polyfill for HTML5 Fullscreen API where the webview has none of its own:
+// Linux, and a Mac only if its engine reports none (Wry turns WebKit's on for
+// every macOS it supports).
 // Bridges the standard requestFullscreen / exitFullscreen DOM API to Tauri's
-// native window fullscreen so video sites (YouTube, Vimeo, Bilibili, etc.) can
-// go true fullscreen on their player buttons.
+// native window fullscreen so a player's own button works.
 //
 // Split out from component.js so a future CLI flag (or custom.js override)
 // can short-circuit the polyfill for apps that don't need video fullscreen.
 (function () {
   if (window.__PAKE_FULLSCREEN_POLYFILL__) return;
+
+  // WebKit on macOS has an element fullscreen of its own, which Wry turns on,
+  // and a player needs the real one: YouTube asks for the whole document and
+  // then lays its player out by what only the engine can report, so under the
+  // polyfill the video stayed a box in a full-screen page and the button
+  // could not leave. Read the engine's answer before anything here replaces it.
+  function engineHasFullscreen() {
+    if (!/^Mac/.test(navigator.platform || "")) return false;
+    return (
+      document.fullscreenEnabled === true ||
+      document.webkitFullscreenEnabled === true
+    );
+  }
+  if (engineHasFullscreen()) return;
+
   window.__PAKE_FULLSCREEN_POLYFILL__ = true;
 
   function initFullscreenPolyfill() {
-    if (!window.__TAURI__ || !document.head) {
+    if (!window.__PAKE_NATIVE__ || !document.head) {
       setTimeout(initFullscreenPolyfill, 100);
       return;
     }
 
-    const appWindow = window.__TAURI__.window.getCurrentWindow();
+    const appWindow = window.__PAKE_NATIVE__.window.getCurrentWindow();
     let fullscreenElement = null;
     let actualFullscreenElement = null;
     let originalStyles = null;
